@@ -1,5 +1,7 @@
 name: Build iOS dylib
 on: [push]
+permissions:
+  contents: write
 
 jobs:
   build:
